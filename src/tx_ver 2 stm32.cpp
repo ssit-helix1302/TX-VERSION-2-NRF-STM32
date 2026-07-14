@@ -12,8 +12,11 @@
 // --- Switches and LEDs ---
 #define sw1 PB10       // AUX1 ARM SWITCH
 #define sw2 PB5        // AUX2 CONFIG MODE
-#define nrfled PC13    // Built-in LED on STM32 (Active-LOW)
-#define armled PB11    // Arm LED
+#define NRF_LED PC13    // Built-in LED on STM32 (Active-LOW)
+#define ARM_LED PB11    // ARM LED
+
+#define LOWBATT_LED PB9
+#define BUZZER_PIN PB8
 
 // --- Radio & Timing Variables ---
 unsigned long lastSuccessTime = 0;
@@ -22,12 +25,26 @@ bool armstate = false;
 
 unsigned long lastLoopTime = 0;
 const unsigned long loopInterval = 10; // 10ms = 100 Hz
+//const unsigned long lastwritethreshold = 2000; // 2 sec
+//unsigned long lastwritetime = 0 ; 
+
 
 #define CE_PIN PB0
 #define CSN_PIN PB1
 
 RF24 radio(CE_PIN, CSN_PIN);
-const byte location[5] = "F450"; 
+const byte location[10] = "MiniDrone"; 
+
+// Telemetry & Voltage Variables ---
+float droneVoltage = 0.0;
+float VOLTAGE_CALIBRATION = 0.995;
+const float VOLTAGE_MULTIPLIER = (3.3 / 4095.0) * 2.0; 
+
+int ledSagCounter = 0;
+int buzzerSagCounter = 0;
+bool lowBattLedActive = false;
+bool criticalBattBuzzerActive = false;
+const int SAG_THRESHOLD = 100;
 
 // --- Data Structures ---
 typedef struct __attribute__((packed)) drone {
@@ -48,11 +65,18 @@ int simpleChannel(int raw) {
 }
 
 void setup() {
+  //Serial.begin(115200);
+
   pinMode(sw1, INPUT_PULLUP);
   pinMode(sw2, INPUT_PULLUP);
   
-  pinMode(armled, OUTPUT); 
-  pinMode(nrfled, OUTPUT);
+  pinMode(ARM_LED, OUTPUT); 
+  pinMode(NRF_LED, OUTPUT);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LOWBATT_LED, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LOWBATT_LED, LOW);
 
   analogReadResolution(12);
 
@@ -82,7 +106,7 @@ void loop() {
 
     // 2. ARM Switch Logic (SW 1)
     armstate = (digitalRead(sw1) == LOW);
-    digitalWrite(armled, armstate ? HIGH : LOW);
+    digitalWrite(ARM_LED, armstate ? HIGH : LOW);
     dataToRX.arm = armstate;
     dataToRX.disarm = !armstate;
 
@@ -92,6 +116,13 @@ void loop() {
     } else {
       dataToRX.aux2 = 1000;
     }
+     
+    // If the battery has sagged below 3.5V for 200 ticks, force stop.
+    if (criticalBattBuzzerActive) {
+      dataToRX.throttle = 1000; 
+      dataToRX.arm = 0;         
+      dataToRX.disarm = 1;
+    }
 
     // 4. Radio Exchange
     radio.stopListening();
@@ -99,18 +130,64 @@ void loop() {
       lastSuccessTime = millis();
       failsafeActive = false;
       
-      // Formal Telemetry Check: Read to clear the buffer, but do nothing with it.
+     // 5.
       if (radio.isAckPayloadAvailable()) {
         radio.read(&dataFromRX, sizeof(dataFromRX));
+
+        droneVoltage = dataFromRX.rawDroneVoltage * VOLTAGE_MULTIPLIER*VOLTAGE_CALIBRATION;
+        
+        if (droneVoltage > 3.30) { 
+          
+          if (droneVoltage < 3.70) {
+            ledSagCounter++;
+            if (ledSagCounter >= SAG_THRESHOLD) {
+              lowBattLedActive = true;
+            }
+          } else {
+            ledSagCounter = 0;
+          }
+
+          if (droneVoltage < 3.60) {
+            buzzerSagCounter++;
+            if (buzzerSagCounter >= SAG_THRESHOLD) {
+              criticalBattBuzzerActive = true;
+            }
+          } else {
+            buzzerSagCounter = 0;
+          }
+        } else {
+          lowBattLedActive = true;
+        }
       }
     }
+    
+    /*if (currentMillis - lastwritetime >= lastwritethreshold) {
+      Serial.print("Drone Battery Voltage : ");
+      Serial.print(droneVoltage);
+      Serial.println("");
+      lastwritetime = currentMillis;
+    }*/
 
-    // 5. Failsafe & Status Checking
+
+    // 6. Failsafe & Status Checking
     if (millis() - lastSuccessTime > 500) {
       failsafeActive = true;
+      droneVoltage = 0.0;
+      lowBattLedActive = false;
+      criticalBattBuzzerActive = false;
+      ledSagCounter = 0;
+      buzzerSagCounter = 0;
     }
     
     // STM32 LED indicator (Active-LOW on most STM32 boards)
-    digitalWrite(nrfled, !radio.isChipConnected()); 
-  }
-}
+    digitalWrite(NRF_LED, !radio.isChipConnected());
+
+    digitalWrite(LOWBATT_LED, lowBattLedActive ? HIGH : LOW); 
+
+    if (criticalBattBuzzerActive && armstate && !failsafeActive) {
+      digitalWrite(BUZZER_PIN, HIGH);
+    } else {
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+  } 
+} 
